@@ -58,7 +58,10 @@ endif()
 
 add_executable(mold)
 target_compile_features(mold PRIVATE cxx_std_20)
-target_link_libraries(mold PRIVATE ${CMAKE_DL_LIBS})
+
+if(MINGW)
+  set(CMAKE_DL_LIBS dl)
+endif()
 
 if(NOT "${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}" STREQUAL "MSVC")
   target_compile_options(mold PRIVATE
@@ -328,7 +331,7 @@ list(APPEND MOLD_ELF_TEMPLATE_FILES
   elf/tls.cc
   )
 
-if(WIN32)
+if(WIN32 AND NOT MINGW)
   list(APPEND MOLD_ELF_TEMPLATE_FILES elf/lto-win32.cc)
 else()
   list(APPEND MOLD_ELF_TEMPLATE_FILES elf/lto-unix.cc)
