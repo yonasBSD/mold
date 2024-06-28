@@ -44,7 +44,7 @@
 # features and behave exactly the same.
 
 cmake_minimum_required(VERSION 3.14)
-project(mold VERSION 2.32.0)
+project(mold VERSION 2.32.1)
 
 include(CMakeDependentOption)
 include(CheckSymbolExists)
@@ -61,6 +61,8 @@ target_compile_features(mold PRIVATE cxx_std_20)
 
 if(MINGW)
   target_link_libraries(mold PRIVATE dl)
+else()
+  target_link_libraries(mold PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 if(NOT "${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}" STREQUAL "MSVC")
