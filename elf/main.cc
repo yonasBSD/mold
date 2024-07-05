@@ -375,11 +375,9 @@ int elf_main(int argc, char **argv) {
                  << ": " << errno_string();
 
   // Fork a subprocess unless --no-fork is given.
-  std::function<void()> on_complete;
-
 #if !defined(_WIN32) && !defined(__APPLE__)
   if (ctx.arg.fork)
-    on_complete = fork_child();
+    fork_child();
 #endif
 
   acquire_global_lock();
@@ -664,20 +662,19 @@ int elf_main(int argc, char **argv) {
   // so we sort them.
   ctx.reldyn->sort(ctx);
 
-  // Zero-clear paddings between sections
-  clear_padding(ctx);
+  // .note.gnu.build-id section contains a cryptographic hash of the
+  // entire output file. Now that we wrote everything except build-id,
+  // we can compute it.
+  if (ctx.buildid) {
+    compute_build_id(ctx);
+    ctx.buildid->copy_buf(ctx);
+  }
 
   // .gdb_index's contents cannot be constructed before applying
   // relocations to other debug sections. We have relocated debug
   // sections now, so write the .gdb_index section.
   if (ctx.gdb_index)
     write_gdb_index(ctx);
-
-  // .note.gnu.build-id section contains a cryptographic hash of the
-  // entire output file. Now that we wrote everything except build-id,
-  // we can compute it.
-  if (ctx.buildid)
-    ctx.buildid->write_buildid(ctx);
 
   t_copy.stop();
   ctx.checkpoint();
@@ -707,8 +704,8 @@ int elf_main(int argc, char **argv) {
   std::cout << std::flush;
   std::cerr << std::flush;
 
-  if (on_complete)
-    on_complete();
+  if (ctx.arg.fork)
+    notify_parent();
 
   release_global_lock();
 

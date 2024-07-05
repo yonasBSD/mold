@@ -949,9 +949,8 @@ public:
 
   void update_shdr(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
-  void write_buildid(Context<E> &ctx);
 
-  static constexpr i64 HEADER_SIZE = 16;
+  std::vector<u8> contents;
 };
 
 template <typename E>
@@ -1368,7 +1367,8 @@ void print_map(Context<E> &ctx);
 // subprocess.cc
 //
 
-std::function<void()> fork_child();
+void fork_child();
+void notify_parent();
 
 template <typename E>
 [[noreturn]]
@@ -1426,11 +1426,11 @@ template <typename E> void apply_version_script(Context<E> &);
 template <typename E> void parse_symbol_version(Context<E> &);
 template <typename E> void compute_import_export(Context<E> &);
 template <typename E> void compute_address_significance(Context<E> &);
-template <typename E> void clear_padding(Context<E> &);
 template <typename E> void compute_section_headers(Context<E> &);
 template <typename E> i64 set_osec_offsets(Context<E> &);
 template <typename E> void fix_synthetic_symbols(Context<E> &);
 template <typename E> i64 compress_debug_sections(Context<E> &);
+template <typename E> void compute_build_id(Context<E> &);
 template <typename E> void write_dependency_file(Context<E> &);
 template <typename E> void show_stats(Context<E> &);
 
@@ -1565,7 +1565,18 @@ private:
 //
 
 struct BuildId {
-  i64 size() const;
+  i64 size() const {
+    switch (kind) {
+    case HEX:
+      return value.size();
+    case HASH:
+      return hash_size;
+    case UUID:
+      return 16;
+    default:
+      unreachable();
+    }
+  }
 
   enum { NONE, HEX, HASH, UUID } kind = NONE;
   std::vector<u8> value;
