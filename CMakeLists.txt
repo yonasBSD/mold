@@ -328,7 +328,6 @@ list(APPEND MOLD_ELF_TEMPLATE_FILES
   elf/output-chunks.cc
   elf/passes.cc
   elf/relocatable.cc
-  elf/subprocess.cc
   elf/thunks.cc
   elf/tls.cc
   )
@@ -337,6 +336,12 @@ if(WIN32 AND NOT MINGW)
   list(APPEND MOLD_ELF_TEMPLATE_FILES elf/lto-win32.cc)
 else()
   list(APPEND MOLD_ELF_TEMPLATE_FILES elf/lto-unix.cc)
+endif()
+
+if(WIN32)
+  list(APPEND MOLD_ELF_TEMPLATE_FILES elf/subprocess-win32.cc)
+else()
+  list(APPEND MOLD_ELF_TEMPLATE_FILES elf/subprocess-unix.cc)
 endif()
 
 function(mold_instantiate_templates SOURCE TARGET)
