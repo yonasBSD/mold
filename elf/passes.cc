@@ -156,6 +156,8 @@ void create_synthetic_sections(Context<E> &ctx) {
     ctx.verdef = push(new VerdefSection<E>);
   if (ctx.arg.emit_relocs)
     ctx.eh_frame_reloc = push(new EhFrameRelocSection<E>);
+  if (!ctx.arg.separate_debug_file.empty())
+    ctx.gnu_debuglink = push(new GnuDebuglinkSection<E>);
 
   if (ctx.arg.shared || !ctx.dsos.empty() || ctx.arg.pie) {
     ctx.dynamic = push(new DynamicSection<E>(ctx));
@@ -402,25 +404,50 @@ void kill_eh_frame_sections(Context<E> &ctx) {
 }
 
 template <typename E>
-void split_section_pieces(Context<E> &ctx) {
-  Timer t(ctx, "split_section_pieces");
+void create_merged_sections(Context<E> &ctx) {
+  Timer t(ctx, "create_merged_sections");
+
+  // Convert InputSections to MergeableSections.
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    file->convert_mergeable_sections(ctx);
+  });
+
+  tbb::parallel_for_each(ctx.merged_sections,
+                         [&](std::unique_ptr<MergedSection<E>> &sec) {
+    if (sec->shdr.sh_flags & SHF_ALLOC)
+      sec->resolve(ctx);
+  });
 
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    file->initialize_mergeable_sections(ctx);
+    file->reattach_section_pieces(ctx);
   });
-}
 
-template <typename E>
-void resolve_section_pieces(Context<E> &ctx) {
-  Timer t(ctx, "resolve_section_pieces");
+  // Add strings to .comment
+  if (!ctx.arg.oformat_binary) {
+    ElfShdr<E> shdr = {};
+    shdr.sh_type = SHT_PROGBITS;
+    shdr.sh_flags = SHF_MERGE | SHF_STRINGS;
 
-  // We aim 2/3 occupation ratio
-  for (std::unique_ptr<MergedSection<E>> &sec : ctx.merged_sections)
-    sec->map.resize(sec->estimator.get_cardinality() * 3 / 2);
+    MergedSection<E> *sec = MergedSection<E>::get_instance(ctx, ".comment", shdr);
+    if (!sec->resolved) {
+      sec->map.resize(4096);
+      sec->resolved = true;
+    }
 
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    file->resolve_section_pieces(ctx);
-  });
+    auto add = [&](std::string str) {
+      std::string_view buf = save_string(ctx, str);
+      std::string_view data(buf.data(), buf.size() + 1);
+      sec->insert(ctx, data, hash_string(data), 0);
+    };
+
+    // Add an identification string to .comment.
+    add(get_mold_version());
+
+    // Embed command line arguments for debugging.
+    char *env = getenv("MOLD_DEBUG");
+    if (env && env[0])
+      add("mold command line: " + get_cmdline_args(ctx));
+  }
 }
 
 template <typename E>
@@ -439,55 +466,6 @@ static std::string get_cmdline_args(Context<E> &ctx) {
   for (i64 i = 2; i < ctx.cmdline_args.size(); i++)
     ss << " " << ctx.cmdline_args[i];
   return ss.str();
-}
-
-template <typename E>
-void add_comment_string(Context<E> &ctx, std::string str) {
-  ElfShdr<E> shdr = {};
-  shdr.sh_type = SHT_PROGBITS;
-  shdr.sh_flags = SHF_MERGE | SHF_STRINGS;
-  shdr.sh_entsize = 1;
-  shdr.sh_addralign = 1;
-
-  MergedSection<E> *sec = MergedSection<E>::get_instance(ctx, ".comment", shdr);
-  if (sec->map.nbuckets == 0)
-    sec->map.resize(4096);
-
-  std::string_view buf = save_string(ctx, str);
-  std::string_view data(buf.data(), buf.size() + 1);
-  sec->insert(ctx, data, hash_string(data), 0);
-}
-
-template <typename E>
-void compute_merged_section_sizes(Context<E> &ctx) {
-  Timer t(ctx, "compute_merged_section_sizes");
-
-  // Add an identification string to .comment.
-  if (!ctx.arg.oformat_binary)
-    add_comment_string(ctx, get_mold_version());
-
-  // Embed command line arguments for debugging.
-  if (char *env = getenv("MOLD_DEBUG"); env && env[0])
-    add_comment_string(ctx, "mold command line: " + get_cmdline_args(ctx));
-
-  tbb::parallel_for_each(ctx.merged_sections,
-                         [&](std::unique_ptr<MergedSection<E>> &sec) {
-    sec->assign_offsets(ctx);
-  });
-}
-
-template <typename T>
-static std::vector<std::span<T>> split(std::vector<T> &input, i64 unit) {
-  std::span<T> span(input);
-  std::vector<std::span<T>> vec;
-
-  while (span.size() >= unit) {
-    vec.push_back(span.subspan(0, unit));
-    span = span.subspan(unit);
-  }
-  if (!span.empty())
-    vec.push_back(span);
-  return vec;
 }
 
 template <typename E>
@@ -729,8 +707,7 @@ void create_output_sections(Context<E> &ctx) {
 
   // Add output sections and mergeable sections to ctx.chunks
   for (std::unique_ptr<MergedSection<E>> &osec : ctx.merged_sections)
-    if (osec->shdr.sh_size)
-      chunks.push_back(osec.get());
+    chunks.push_back(osec.get());
 
   // Sections are added to the section lists in an arbitrary order
   // because they are created in parallel. Sort them to to make the
@@ -1362,76 +1339,24 @@ template <typename E>
 void compute_section_sizes(Context<E> &ctx) {
   Timer t(ctx, "compute_section_sizes");
 
-  struct Group {
-    i64 size = 0;
-    i64 p2align = 0;
-    i64 offset = 0;
-    std::span<InputSection<E> *> members;
-  };
-
-  tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-    OutputSection<E> *osec = chunk->to_osec();
-    if (!osec)
-      return;
-
-    // This pattern will be processed in the next loop.
-    if constexpr (needs_thunk<E>)
-      if ((osec->shdr.sh_flags & SHF_EXECINSTR) && !ctx.arg.relocatable)
-        return;
-
-    // Since one output section may contain millions of input sections,
-    // we first split input sections into groups and assign offsets to
-    // groups.
-    std::vector<Group> groups;
-    constexpr i64 group_size = 10000;
-
-    for (std::span<InputSection<E> *> span : split(osec->members, group_size))
-      groups.push_back(Group{.members = span});
-
-    tbb::parallel_for_each(groups, [](Group &group) {
-      for (InputSection<E> *isec : group.members) {
-        group.size = align_to(group.size, 1 << isec->p2align) + isec->sh_size;
-        group.p2align = std::max<i64>(group.p2align, isec->p2align);
-      }
-    });
-
-    ElfShdr<E> &shdr = osec->shdr;
-    shdr.sh_size = 0;
-
-    for (i64 i = 0; i < groups.size(); i++) {
-      shdr.sh_size = align_to(shdr.sh_size, 1 << groups[i].p2align);
-      groups[i].offset = shdr.sh_size;
-      shdr.sh_size += groups[i].size;
-      shdr.sh_addralign = std::max<u32>(shdr.sh_addralign, 1 << groups[i].p2align);
-    }
-
-    // Assign offsets to input sections.
-    tbb::parallel_for_each(groups, [](Group &group) {
-      i64 offset = group.offset;
-      for (InputSection<E> *isec : group.members) {
-        offset = align_to(offset, 1 << isec->p2align);
-        isec->offset = offset;
-        offset += isec->sh_size;
-      }
-    });
-  });
-
-  // On ARM32 or ARM64, we may need to create so-called "range extension
-  // thunks" to extend branch instructions reach, as they can jump only
-  // to ±16 MiB or ±128 MiB, respecitvely.
-  //
-  // In the following loop, We compute the sizes of sections while
-  // inserting thunks. This pass cannot be parallelized. That is,
-  // create_range_extension_thunks is parallelized internally, but the
-  // function itself is not thread-safe.
   if constexpr (needs_thunk<E>) {
-    Timer t2(ctx, "create_range_extension_thunks");
+    // Chunk<E>::compute_section_size may obtain a global lock to create
+    // range extension thunks. I don't know why, but using parallel_for
+    // loop both inside and outside of the lock may cause a deadlock. It
+    // might be a bug in TBB. For now, I'll avoid using parallel_for_each
+    // here.
+    for (Chunk<E> *chunk : ctx.chunks)
+      if (chunk->shdr.sh_flags & SHF_EXECINSTR)
+        chunk->compute_section_size(ctx);
 
-    if (!ctx.arg.relocatable)
-      for (Chunk<E> *chunk : ctx.chunks)
-        if (OutputSection<E> *osec = chunk->to_osec())
-          if (osec->shdr.sh_flags & SHF_EXECINSTR)
-            osec->create_range_extension_thunks(ctx);
+    tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
+      if (!(chunk->shdr.sh_flags & SHF_EXECINSTR))
+        chunk->compute_section_size(ctx);
+    });
+  } else {
+    tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
+      chunk->compute_section_size(ctx);
+    });
   }
 }
 
@@ -2679,6 +2604,24 @@ static i64 set_file_offsets(Context<E> &ctx) {
   return fileoff;
 }
 
+// Remove debug sections from ctx.chunks and save them to ctx.debug_chunks.
+// This is for --separate-debug-file.
+template <typename E>
+void separate_debug_sections(Context<E> &ctx) {
+  auto is_debug_section = [&](Chunk<E> *chunk) {
+    if (chunk->shdr.sh_flags & SHF_ALLOC)
+      return false;
+    return chunk == ctx.gdb_index || chunk == ctx.symtab || chunk == ctx.strtab ||
+           chunk->name.starts_with(".debug_");
+  };
+
+  auto mid = std::stable_partition(ctx.chunks.begin(), ctx.chunks.end(),
+                                   is_debug_section);
+
+  ctx.debug_chunks = {ctx.chunks.begin(), mid};
+  ctx.chunks.erase(ctx.chunks.begin(), mid);
+}
+
 template <typename E>
 void compute_section_headers(Context<E> &ctx) {
   // Update sh_size for each chunk.
@@ -3009,23 +2952,34 @@ static void blake3_hash(u8 *buf, i64 size, u8 *out) {
 }
 
 template <typename E>
-void compute_build_id(Context<E> &ctx) {
-  Timer t(ctx, "compute_build_id");
+std::vector<std::span<u8>> get_shards(Context<E> &ctx) {
+  constexpr i64 shard_size = 4 * 1024 * 1024; // 4 MiB
+  std::span<u8> buf = {ctx.buf, (size_t)ctx.output_file->filesize};
+  std::vector<std::span<u8>> vec;
+
+  while (!buf.empty()) {
+    i64 sz = std::min<i64>(shard_size, buf.size());
+    vec.push_back(buf.subspan(0, sz));
+    buf = buf.subspan(sz);
+  }
+  return vec;
+}
+
+template <typename E>
+void write_build_id(Context<E> &ctx) {
+  Timer t(ctx, "write_build_id");
 
   switch (ctx.arg.build_id.kind) {
   case BuildId::HEX:
     ctx.buildid->contents = ctx.arg.build_id.value;
     break;
   case BuildId::HASH: {
-    i64 shard_size = 4 * 1024 * 1024;
-    i64 filesize = ctx.output_file->filesize;
-    i64 num_shards = align_to(filesize, shard_size) / shard_size;
-    std::vector<u8> shards(num_shards * BLAKE3_OUT_LEN);
+    std::vector<std::span<u8>> shards = get_shards(ctx);
+    std::vector<u8> hashes(shards.size() * BLAKE3_OUT_LEN);
 
-    tbb::parallel_for((i64)0, num_shards, [&](i64 i) {
-      u8 *begin = ctx.buf + shard_size * i;
-      u8 *end = (i == num_shards - 1) ? ctx.buf + filesize : begin + shard_size;
-      blake3_hash(begin, end - begin, shards.data() + i * BLAKE3_OUT_LEN);
+    tbb::parallel_for((i64)0, (i64)shards.size(), [&](i64 i) {
+      blake3_hash(shards[i].data(), shards[i].size(),
+                  hashes.data() + i * BLAKE3_OUT_LEN);
 
 #ifdef HAVE_MADVISE
       // Make the kernel page out the file contents we've just written
@@ -3036,7 +2990,7 @@ void compute_build_id(Context<E> &ctx) {
     });
 
     u8 buf[BLAKE3_OUT_LEN];
-    blake3_hash(shards.data(), shards.size(), buf);
+    blake3_hash(hashes.data(), hashes.size(), buf);
 
     assert(ctx.arg.build_id.size() <= BLAKE3_OUT_LEN);
     ctx.buildid->contents = {buf, buf + ctx.arg.build_id.size()};
@@ -3055,8 +3009,109 @@ void compute_build_id(Context<E> &ctx) {
   default:
     unreachable();
   }
+
+  ctx.buildid->copy_buf(ctx);
 }
 
+// A .gnu_debuglink section contains a filename and a CRC32 checksum of a
+// debug info file. When we are writing a .gnu_debuglink, we don't know
+// its CRC32 checksum because we haven't created a debug info file. So we
+// write a dummy value instead.
+//
+// We can't choose a random value as a dummy value for build
+// reproducibility. We also don't want to write a fixed value for all
+// files because the CRC checksum is in this section to prevent using
+// wrong file on debugging. gdb rejects a debug info file if its CRC
+// doesn't match with the one in .gdb_debuglink.
+//
+// Therefore, we'll try to make our CRC checksum as unique as possible.
+// We'll remember that checksum, and after creating a debug info file, add
+// a few bytes of garbage at the end of it so that the debug info file's
+// CRC checksum becomes the one that we have precomputed.
+template <typename E>
+void write_gnu_debuglink(Context<E> &ctx) {
+  Timer t(ctx, "write_gnu_debuglink");
+  u32 crc32;
+
+  if (ctx.buildid) {
+    crc32 = compute_crc32(0, ctx.buildid->contents.data(),
+                          ctx.buildid->contents.size());
+  } else {
+    std::vector<std::span<u8>> shards = get_shards(ctx);
+    std::vector<U64<E>> hashes(shards.size());
+
+    tbb::parallel_for((i64)0, (i64)shards.size(), [&](i64 i) {
+      hashes[i] = hash_string({(char *)shards[i].data(), shards[i].size()});
+    });
+    crc32 = compute_crc32(0, (u8 *)hashes.data(), hashes.size() * 8);
+  }
+
+  ctx.gnu_debuglink->crc32 = crc32;
+  ctx.gnu_debuglink->copy_buf(ctx);
+}
+
+// Write a separate debug file. This function is called after we finish
+// writing to the usual output file.
+template <typename E>
+void write_separate_debug_file(Context<E> &ctx) {
+  Timer t(ctx, "write_separate_debug_file");
+
+  // We want to write to the debug info file in background so that the
+  // user doesn't have to wait for it to complete.
+  if (!ctx.arg.stats && !ctx.arg.perf)
+    notify_parent();
+
+  // A debug info file contains all sections as the original file, though
+  // most of them can be empty as if they were bss sections. We convert
+  // real sections into dummy sections here.
+  for (i64 i = 0; i < ctx.chunks.size(); i++) {
+    Chunk<E> *chunk = ctx.chunks[i];
+    if (chunk != ctx.ehdr && chunk != ctx.shdr && chunk != ctx.shstrtab &&
+        chunk->shdr.sh_type != SHT_NOTE) {
+      Chunk<E> *sec = new OutputSection<E>(chunk->name, SHT_NULL);
+      sec->shdr = chunk->shdr;
+      sec->shdr.sh_type = SHT_NOBITS;
+
+      ctx.chunks[i] = sec;
+      ctx.chunk_pool.emplace_back(sec);
+    }
+  }
+
+  // Restore debug info sections that had been set aside while we were
+  // creating the main file.
+  tbb::parallel_for_each(ctx.debug_chunks, [&](Chunk<E> *chunk) {
+    chunk->compute_section_size(ctx);
+  });
+
+  append(ctx.chunks, ctx.debug_chunks);
+
+  // Write to the debug info file as if it were a regular output file.
+  compute_section_headers(ctx);
+  i64 filesize = set_osec_offsets(ctx);
+
+  ctx.output_file =
+    OutputFile<Context<E>>::open(ctx, ctx.arg.separate_debug_file,
+                                 filesize, 0666);
+  ctx.buf = ctx.output_file->buf;
+
+  copy_chunks(ctx);
+
+  if (ctx.gdb_index)
+    write_gdb_index(ctx);
+
+  // Reverse-compute a CRC32 value so that the CRC32 checksum embedded to
+  // the .gnu_debuglink section in the main executable matches with the
+  // debug info file's CRC32 checksum.
+  std::vector<u8> &buf2 = ctx.output_file->buf2;
+  i64 datalen = filesize + buf2.size();
+
+  u32 crc = compute_crc32(0, ctx.buf, filesize);
+  crc = compute_crc32(crc, buf2.data(), buf2.size());
+
+  std::vector<u8> trailer = crc32_solve(datalen, crc, ctx.gnu_debuglink->crc32);
+  append(ctx.output_file->buf2, trailer);
+  ctx.output_file->close(ctx);
+}
 
 // Write Makefile-style dependency rules to a file specified by
 // --dependency-file. This is analogous to the compiler's -M flag.
@@ -3162,10 +3217,8 @@ template void apply_exclude_libs(Context<E> &);
 template void create_synthetic_sections(Context<E> &);
 template void resolve_symbols(Context<E> &);
 template void kill_eh_frame_sections(Context<E> &);
-template void split_section_pieces(Context<E> &);
-template void resolve_section_pieces(Context<E> &);
+template void create_merged_sections(Context<E> &);
 template void convert_common_symbols(Context<E> &);
-template void compute_merged_section_sizes(Context<E> &);
 template void create_output_sections(Context<E> &);
 template void add_synthetic_symbols(Context<E> &);
 template void check_cet_errors(Context<E> &);
@@ -3193,11 +3246,14 @@ template void apply_version_script(Context<E> &);
 template void parse_symbol_version(Context<E> &);
 template void compute_import_export(Context<E> &);
 template void compute_address_significance(Context<E> &);
+template void separate_debug_sections(Context<E> &);
 template void compute_section_headers(Context<E> &);
 template i64 set_osec_offsets(Context<E> &);
 template void fix_synthetic_symbols(Context<E> &);
 template i64 compress_debug_sections(Context<E> &);
-template void compute_build_id(Context<E> &);
+template void write_build_id(Context<E> &);
+template void write_gnu_debuglink(Context<E> &);
+template void write_separate_debug_file(Context<E> &);
 template void write_dependency_file(Context<E> &);
 template void show_stats(Context<E> &);
 

@@ -865,6 +865,84 @@ void DynamicSection<E>::copy_buf(Context<E> &ctx) {
   write_vector(ctx.buf + this->shdr.sh_offset, contents);
 }
 
+template <typename T>
+static std::vector<std::span<T>> split(std::vector<T> &input, i64 unit) {
+  std::span<T> span(input);
+  std::vector<std::span<T>> vec;
+
+  while (span.size() >= unit) {
+    vec.push_back(span.subspan(0, unit));
+    span = span.subspan(unit);
+  }
+  if (!span.empty())
+    vec.push_back(span);
+  return vec;
+}
+
+
+// Assign offsets to OutputSection members
+template <typename E>
+void OutputSection<E>::compute_section_size(Context<E> &ctx) {
+  ElfShdr<E> &shdr = this->shdr;
+
+  // On most RISC systems, we need to create so-called "range extension
+  // thunks" to extend branch instructions reach, as their jump
+  // instructions' reach is limited. create_range_extension_thunks()
+  // computes the size of the section while inserting thunks.
+  if constexpr (needs_thunk<E>) {
+    if ((shdr.sh_flags & SHF_EXECINSTR) && !ctx.arg.relocatable) {
+      create_range_extension_thunks(ctx);
+      return;
+    }
+  }
+
+  // Since one output section may contain millions of input sections,
+  // we first split input sections into groups and assign offsets to
+  // groups.
+  struct Group {
+    std::span<InputSection<E> *> members;
+    i64 size = 0;
+    i64 p2align = 0;
+    i64 offset = 0;
+  };
+
+  std::span<InputSection<E> *> mem = members;
+  std::vector<Group> groups;
+  constexpr i64 group_size = 10000;
+
+  while (!mem.empty()) {
+    i64 sz = std::min<i64>(group_size, mem.size());
+    groups.push_back({mem.subspan(0, sz)});
+    mem = mem.subspan(sz);
+  }
+
+  tbb::parallel_for_each(groups, [](Group &group) {
+    for (InputSection<E> *isec : group.members) {
+      group.size = align_to(group.size, 1 << isec->p2align) + isec->sh_size;
+      group.p2align = std::max<i64>(group.p2align, isec->p2align);
+    }
+  });
+
+  shdr.sh_size = 0;
+
+  for (i64 i = 0; i < groups.size(); i++) {
+    shdr.sh_size = align_to(shdr.sh_size, 1 << groups[i].p2align);
+    groups[i].offset = shdr.sh_size;
+    shdr.sh_size += groups[i].size;
+    shdr.sh_addralign = std::max<u32>(shdr.sh_addralign, 1 << groups[i].p2align);
+  }
+
+  // Assign offsets to input sections.
+  tbb::parallel_for_each(groups, [](Group &group) {
+    i64 offset = group.offset;
+    for (InputSection<E> *isec : group.members) {
+      offset = align_to(offset, 1 << isec->p2align);
+      isec->offset = offset;
+      offset += isec->sh_size;
+    }
+  });
+}
+
 template <typename E>
 void OutputSection<E>::copy_buf(Context<E> &ctx) {
   if (this->shdr.sh_type != SHT_NOBITS)
@@ -1621,10 +1699,14 @@ ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name,
   };
 
   i64 shndx = -1;
+  InputSection<E> *isec = sym.get_input_section();
+
   if (sym.has_copyrel) {
+    // Symbol in .copyrel
     shndx = sym.is_copyrel_readonly ? ctx.copyrel_relro->shndx : ctx.copyrel->shndx;
     esym.st_value = sym.get_addr(ctx);
   } else if (sym.file->is_dso || sym.esym().is_undef()) {
+    // Undefined symbol in a DSO
     esym.st_shndx = SHN_UNDEF;
     esym.st_size = 0;
     if (sym.is_canonical)
@@ -1637,7 +1719,7 @@ ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name,
     // Section fragment
     shndx = frag->output_section.shndx;
     esym.st_value = sym.get_addr(ctx);
-  } else if (!sym.get_input_section()) {
+  } else if (!isec) {
     // Absolute symbol
     esym.st_shndx = SHN_ABS;
     esym.st_value = sym.get_addr(ctx);
@@ -1651,7 +1733,25 @@ ElfSym<E> to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name,
     esym.st_type = STT_FUNC;
     esym.st_visibility = sym.visibility;
     esym.st_value = sym.get_plt_addr(ctx);
+  } else if (!isec->output_section) {
+    // Symbol in a mergeable non-SHF_ALLOC section, such as .debug_str
+    assert(!(isec->shdr().sh_flags & SHF_ALLOC));
+    assert(isec->shdr().sh_flags & SHF_MERGE);
+    assert(!sym.file->is_dso);
+
+    ObjectFile<E> *file = (ObjectFile<E> *)sym.file;
+    MergeableSection<E> *m =
+      file->mergeable_sections[file->get_shndx(sym.esym())].get();
+
+    SectionFragment<E> *frag;
+    i64 frag_addend;
+    std::tie(frag, frag_addend) = m->get_fragment(sym.esym().st_value);
+
+    shndx = m->parent.shndx;
+    esym.st_visibility = sym.visibility;
+    esym.st_value = frag->get_addr(ctx) + frag_addend;
   } else {
+    // Symbol in a regular section
     shndx = get_st_shndx(sym);
     esym.st_visibility = sym.visibility;
     esym.st_value = sym.get_addr(ctx, NO_PLT);
@@ -1971,7 +2071,26 @@ MergedSection<E>::insert(Context<E> &ctx, std::string_view data, u64 hash,
 }
 
 template <typename E>
-void MergedSection<E>::assign_offsets(Context<E> &ctx) {
+void MergedSection<E>::resolve(Context<E> &ctx) {
+  tbb::parallel_for_each(members, [&](MergeableSection<E> *sec) {
+    sec->split_contents(ctx);
+  });
+
+  // We aim 2/3 occupation ratio
+  map.resize(estimator.get_cardinality() * 3 / 2);
+
+  tbb::parallel_for_each(members, [&](MergeableSection<E> *sec) {
+    sec->resolve_contents(ctx);
+  });
+
+  resolved = true;
+}
+
+template <typename E>
+void MergedSection<E>::compute_section_size(Context<E> &ctx) {
+  if (!resolved)
+    resolve(ctx);
+
   std::vector<i64> sizes(map.NUM_SHARDS);
   Atomic<i64> alignment = 1;
 
@@ -2829,6 +2948,20 @@ void ComdatGroupSection<E>::copy_buf(Context<E> &ctx) {
     *buf++ = chunk->shndx;
 }
 
+template <typename E>
+void GnuDebuglinkSection<E>::update_shdr(Context<E> &ctx) {
+  filename = std::filesystem::path(ctx.arg.separate_debug_file).filename().string();
+  this->shdr.sh_size = align_to(filename.size() + 1, 4) + 4;
+}
+
+template <typename E>
+void GnuDebuglinkSection<E>::copy_buf(Context<E> &ctx) {
+  u8 *buf = ctx.buf + this->shdr.sh_offset;
+  memset(buf, 0, this->shdr.sh_size);
+  write_string(buf, filename);
+  *(U32<E> *)(buf + this->shdr.sh_size - 4) = crc32;
+}
+
 using E = MOLD_TARGET;
 
 template class Chunk<E>;
@@ -2867,6 +3000,7 @@ template class GdbIndexSection<E>;
 template class CompressedSection<E>;
 template class RelocSection<E>;
 template class ComdatGroupSection<E>;
+template class GnuDebuglinkSection<E>;
 
 template OutputSection<E> *find_section(Context<E> &, u32);
 template OutputSection<E> *find_section(Context<E> &, std::string_view);

@@ -373,6 +373,7 @@ public:
   virtual ~Chunk() = default;
   virtual bool is_header() { return false; }
   virtual OutputSection<E> *to_osec() { return nullptr; }
+  virtual void compute_section_size(Context<E> &ctx) {}
   virtual i64 get_reldyn_size(Context<E> &ctx) const { return 0; }
   virtual void construct_relr(Context<E> &ctx) {}
   virtual void copy_buf(Context<E> &ctx) {}
@@ -479,6 +480,7 @@ public:
   }
 
   OutputSection<E> *to_osec() override { return this; }
+  void compute_section_size(Context<E> &ctx) override;
   void construct_relr(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
   void write_to(Context<E> &ctx, u8 *buf) override;
@@ -805,13 +807,18 @@ public:
   SectionFragment<E> *insert(Context<E> &ctx, std::string_view data,
                              u64 hash, i64 p2align);
 
-  void assign_offsets(Context<E> &ctx);
+  void resolve(Context<E> &ctx);
+  void compute_section_size(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
   void write_to(Context<E> &ctx, u8 *buf) override;
   void print_stats(Context<E> &ctx);
 
+  std::vector<MergeableSection<E> *> members;
+  std::mutex mu;
+
   ConcurrentMap<SectionFragment<E>> map;
   HyperLogLog estimator;
+  bool resolved = false;
 
 private:
   MergedSection(std::string_view name, i64 flags, i64 type, i64 entsize);
@@ -987,6 +994,22 @@ private:
 };
 
 template <typename E>
+class GnuDebuglinkSection : public Chunk<E> {
+public:
+  GnuDebuglinkSection() {
+    this->name = ".gnu_debuglink";
+    this->shdr.sh_type = SHT_PROGBITS;
+    this->shdr.sh_addralign = 4;
+  }
+
+  void update_shdr(Context<E> &ctx) override;
+  void copy_buf(Context<E> &ctx) override;
+
+  std::string filename;
+  u32 crc32 = 0;
+};
+
+template <typename E>
 class GdbIndexSection : public Chunk<E> {
 public:
   GdbIndexSection() {
@@ -1095,14 +1118,17 @@ public:
                    std::unique_ptr<InputSection<E>> &isec);
 
   void split_contents(Context<E> &ctx);
+  void resolve_contents(Context<E> &ctx);
   std::pair<SectionFragment<E> *, i64> get_fragment(i64 offset);
   std::string_view get_contents(i64 idx);
 
   MergedSection<E> &parent;
+  std::vector<SectionFragment<E> *> fragments;
+
+private:
   std::unique_ptr<InputSection<E>> section;
   std::vector<u32> frag_offsets;
   std::vector<u32> hashes;
-  std::vector<SectionFragment<E> *> fragments;
   u8 p2align = 0;
 };
 
@@ -1195,8 +1221,8 @@ public:
 
   void parse(Context<E> &ctx);
   void initialize_symbols(Context<E> &ctx);
-  void initialize_mergeable_sections(Context<E> &ctx);
-  void resolve_section_pieces(Context<E> &ctx);
+  void convert_mergeable_sections(Context<E> &ctx);
+  void reattach_section_pieces(Context<E> &ctx);
   void resolve_symbols(Context<E> &ctx) override;
   void mark_live_objects(Context<E> &ctx,
                          std::function<void(InputFile<E> *)> feeder) override;
@@ -1400,10 +1426,8 @@ template <typename E> void create_synthetic_sections(Context<E> &);
 template <typename E> void set_file_priority(Context<E> &);
 template <typename E> void resolve_symbols(Context<E> &);
 template <typename E> void kill_eh_frame_sections(Context<E> &);
-template <typename E> void split_section_pieces(Context<E> &);
-template <typename E> void resolve_section_pieces(Context<E> &);
+template <typename E> void create_merged_sections(Context<E> &);
 template <typename E> void convert_common_symbols(Context<E> &);
-template <typename E> void compute_merged_section_sizes(Context<E> &);
 template <typename E> void create_output_sections(Context<E> &);
 template <typename E> void add_synthetic_symbols(Context<E> &);
 template <typename E> void apply_section_align(Context<E> &);
@@ -1431,11 +1455,14 @@ template <typename E> void apply_version_script(Context<E> &);
 template <typename E> void parse_symbol_version(Context<E> &);
 template <typename E> void compute_import_export(Context<E> &);
 template <typename E> void compute_address_significance(Context<E> &);
+template <typename E> void separate_debug_sections(Context<E> &);
 template <typename E> void compute_section_headers(Context<E> &);
 template <typename E> i64 set_osec_offsets(Context<E> &);
 template <typename E> void fix_synthetic_symbols(Context<E> &);
 template <typename E> i64 compress_debug_sections(Context<E> &);
-template <typename E> void compute_build_id(Context<E> &);
+template <typename E> void write_build_id(Context<E> &);
+template <typename E> void write_gnu_debuglink(Context<E> &);
+template <typename E> void write_separate_debug_file(Context<E> &ctx);
 template <typename E> void write_dependency_file(Context<E> &);
 template <typename E> void show_stats(Context<E> &);
 
@@ -1799,6 +1826,7 @@ struct Context {
     std::string package_metadata;
     std::string plugin;
     std::string rpaths;
+    std::string separate_debug_file;
     std::string soname;
     std::string sysroot;
     std::unique_ptr<std::unordered_set<std::string_view>> retain_symbols_file;
@@ -1877,6 +1905,9 @@ struct Context {
 
   tbb::concurrent_hash_map<Symbol<E> *, std::vector<std::string>> undef_errors;
 
+  // For --separate-debug-file
+  std::vector<Chunk<E> *> debug_chunks;
+
   // Output chunks
   OutputEhdr<E> *ehdr = nullptr;
   OutputShdr<E> *shdr = nullptr;
@@ -1892,6 +1923,7 @@ struct Context {
   DynstrSection<E> *dynstr = nullptr;
   HashSection<E> *hash = nullptr;
   GnuHashSection<E> *gnu_hash = nullptr;
+  GnuDebuglinkSection<E> *gnu_debuglink = nullptr;
   ShstrtabSection<E> *shstrtab = nullptr;
   PltSection<E> *plt = nullptr;
   PltGotSection<E> *pltgot = nullptr;
@@ -2353,7 +2385,7 @@ InputSection<E>::get_fragment(Context<E> &ctx, const ElfRel<E> &rel) {
   assert(!(shdr().sh_flags & SHF_ALLOC));
 
   const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
-  if (esym.st_type == STT_SECTION)
+  if (!esym.is_abs() && !esym.is_common() && !esym.is_undef())
     if (std::unique_ptr<MergeableSection<E>> &m =
         file.mergeable_sections[file.get_shndx(esym)])
       return m->get_fragment(esym.st_value + get_addend(*this, rel));
