@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <filesystem>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -15,50 +16,47 @@ inline u32 get_umask() {
 }
 
 template <typename Context>
-static std::pair<i64, char *>
-open_or_create_file(Context &ctx, std::string path, i64 filesize, i64 perm) {
-  std::string tmpl = filepath(path).parent_path() / ".mold-XXXXXX";
-  char *path2 = (char *)save_string(ctx, tmpl).data();
-
-  i64 fd = mkstemp(path2);
-  if (fd == -1)
-    Fatal(ctx) << "cannot open " << path2 <<  ": " << errno_string();
-
+static int
+open_or_create_file(Context &ctx, std::string path, std::string tmpfile,
+                    int perm) {
   // Reuse an existing file if exists and writable because on Linux,
   // writing to an existing file is much faster than creating a fresh
   // file and writing to it.
-  if (ctx.overwrite_output_file && rename(path.c_str(), path2) == 0) {
-    ::close(fd);
-    fd = ::open(path2, O_RDWR | O_CREAT, perm);
-    if (fd != -1 && !ftruncate(fd, filesize) && !fchmod(fd, perm & ~get_umask()))
-      return {fd, path2};
-
-    unlink(path2);
-    fd = ::open(path2, O_RDWR | O_CREAT, perm);
-    if (fd == -1)
-      Fatal(ctx) << "cannot open " << path2 << ": " << errno_string();
+  if (ctx.overwrite_output_file && rename(path.c_str(), tmpfile.c_str()) == 0) {
+    i64 fd = ::open(tmpfile.c_str(), O_RDWR | O_CREAT, perm);
+    if (fd != -1)
+      return fd;
+    unlink(tmpfile.c_str());
   }
 
-  if (fchmod(fd, (perm & ~get_umask())) == -1)
-    Fatal(ctx) << "fchmod failed: " << errno_string();
-
-#ifdef __linux__
-  if (fallocate(fd, 0, 0, filesize) == 0)
-    return {fd, path2};
-#endif
-
-  if (ftruncate(fd, filesize) == -1)
-    Fatal(ctx) << "ftruncate failed: " << errno_string();
-  return {fd, path2};
+  i64 fd = ::open(tmpfile.c_str(), O_RDWR | O_CREAT, perm);
+  if (fd == -1)
+    Fatal(ctx) << "cannot open " << tmpfile << ": " << errno_string();
+  return fd;
 }
 
 template <typename Context>
 class MemoryMappedOutputFile : public OutputFile<Context> {
 public:
-  MemoryMappedOutputFile(Context &ctx, std::string path, i64 filesize, i64 perm)
+  MemoryMappedOutputFile(Context &ctx, std::string path, i64 filesize, int perm)
     : OutputFile<Context>(path, filesize, true) {
-    std::tie(this->fd, output_tmpfile) =
-      open_or_create_file(ctx, path, filesize, perm);
+    std::filesystem::path dir = filepath(path).parent_path();
+    std::string filename = filepath(path).filename().string();
+    std::string tmpfile = dir / ("." + filename + "." + std::to_string(getpid()));
+
+    this->fd = open_or_create_file(ctx, path, tmpfile, perm);
+
+    if (fchmod(this->fd, perm & ~get_umask()) == -1)
+      Fatal(ctx) << "fchmod failed: " << errno_string();
+
+    if (ftruncate(this->fd, filesize) == -1)
+      Fatal(ctx) << "ftruncate failed: " << errno_string();
+
+    output_tmpfile = (char *)save_string(ctx, tmpfile).data();
+
+#ifdef __linux__
+    fallocate(this->fd, 0, 0, filesize);
+#endif
 
     this->buf = (u8 *)mmap(nullptr, filesize, PROT_READ | PROT_WRITE,
                            MAP_SHARED, this->fd, 0);
@@ -107,7 +105,7 @@ private:
 
 template <typename Context>
 std::unique_ptr<OutputFile<Context>>
-OutputFile<Context>::open(Context &ctx, std::string path, i64 filesize, i64 perm) {
+OutputFile<Context>::open(Context &ctx, std::string path, i64 filesize, int perm) {
   Timer t(ctx, "open_file");
 
   if (path.starts_with('/') && !ctx.arg.chroot.empty())
@@ -144,6 +142,54 @@ OutputFile<Context>::open(Context &ctx, std::string path, i64 filesize, i64 perm
   if (ctx.arg.filler != -1)
     memset(file->buf, ctx.arg.filler, filesize);
   return std::unique_ptr<OutputFile>(file);
+}
+
+// LockingOutputFile is similar to MemoryMappedOutputFile, but it doesn't
+// rename output files and instead acquires file lock using flock().
+template <typename Context>
+LockingOutputFile<Context>::LockingOutputFile(Context &ctx, std::string path,
+                                              int perm)
+  : OutputFile<Context>(path, 0, true) {
+  this->fd = ::open(path.c_str(), O_RDWR | O_CREAT, perm);
+  if (this->fd == -1)
+    Fatal(ctx) << "cannot open " << path << ": " << errno_string();
+  flock(this->fd, LOCK_EX);
+
+  // We may be overwriting to an existing debug info file. We want to
+  // make the file unusable so that gdb won't use it by accident until
+  // it's ready.
+  u8 buf[256] = {};
+  (void)!!write(this->fd, buf, sizeof(buf));
+}
+
+template <typename Context>
+void LockingOutputFile<Context>::resize(Context &ctx, i64 filesize) {
+  if (ftruncate(this->fd, filesize) == -1)
+    Fatal(ctx) << "ftruncate failed: " << errno_string();
+
+  this->buf = (u8 *)mmap(nullptr, filesize, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, this->fd, 0);
+  if (this->buf == MAP_FAILED)
+    Fatal(ctx) << this->path << ": mmap failed: " << errno_string();
+
+  this->filesize = filesize;
+  mold::output_buffer_start = this->buf;
+  mold::output_buffer_end = this->buf + filesize;
+}
+
+template <typename Context>
+void LockingOutputFile<Context>::close(Context &ctx) {
+  if (!this->is_unmapped)
+    munmap(this->buf, this->filesize);
+
+  if (!this->buf2.empty()) {
+    FILE *out = fdopen(this->fd, "w");
+    fseek(out, 0, SEEK_END);
+    fwrite(&this->buf2[0], this->buf2.size(), 1, out);
+    fclose(out);
+  }
+
+  ::close(this->fd);
 }
 
 } // namespace mold
