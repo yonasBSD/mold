@@ -44,7 +44,7 @@
 # features and behave exactly the same.
 
 cmake_minimum_required(VERSION 3.14)
-project(mold VERSION 2.35.0)
+project(mold VERSION 2.35.1)
 
 include(CMakeDependentOption)
 include(CheckSymbolExists)
@@ -180,7 +180,7 @@ endif()
 # be stable on 32-bit targets.
 cmake_dependent_option(
   MOLD_USE_MIMALLOC "Use mimalloc" ON
-  "CMAKE_SIZEOF_VOID_P EQUAL 8; NOT APPLE; NOT ANDROID; NOT OPENBSD" OFF)
+  "CMAKE_SIZEOF_VOID_P EQUAL 8; NOT APPLE; NOT ANDROID; NOT OPENBSD; NOT MOLD_USE_ASAN; NOT MOLD_USE_TSAN" OFF)
 
 cmake_dependent_option(
   MOLD_USE_SYSTEM_MIMALLOC "Use system or vendored mimalloc" OFF
