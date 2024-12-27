@@ -33,15 +33,14 @@
 # We need a recent version of Clang to build mold. If it's not available
 # via apt-get, we'll build it ourselves.
 #
-# You may need to run the following command to use Docker with Qemu:
-#
-#  $ docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+# You may need to install qemu-user-static package to build non-native
+# binaries.
 
 set -e -x
 cd "$(dirname $0)"
 
 usage() {
-  echo "Usage: $0 [ x86_64 | aarch64 | arm | riscv64 | ppc64le | s390x ]"
+  echo "Usage: $0 [ x86_64 | aarch64 | arm | riscv64 | ppc64le | s390x | loongarch64 ]"
   exit 1
 }
 
@@ -61,26 +60,23 @@ case $# in
   usage
 esac
 
-echo "$arch" | grep -Eq '^(x86_64|aarch64|arm|riscv64|ppc64le|s390x)$' || usage
-
-version=$(sed -n 's/^project(mold VERSION \(.*\))/\1/p' CMakeLists.txt)
-dest=mold-$version-$arch-linux
-
+# Create a Docker image.
 if [ "$GITHUB_REPOSITORY" = '' ]; then
+  cmd="podman run --userns=host"
   image=mold-builder-$arch
-  docker_build="docker build --platform linux/$arch -t $image -"
+  image_build="podman build --arch $arch -t $image -"
 else
   # If this script is running on GitHub Actions, we want to cache
-  # the created Docker image in GitHub's Docker repostiory.
+  # the created container image in GitHub's container repostiory.
+  cmd="docker run"
   image=ghcr.io/$GITHUB_REPOSITORY/mold-builder-$arch
-  docker_build="docker buildx build --platform linux/$arch -t $image --push --cache-to type=inline --cache-from type=registry,ref=ghcr.io/$GITHUB_REPOSITORY/mold-builder-$arch -"
+  image_build="docker buildx build --platform linux/$arch -t $image --push --cache-to type=inline --cache-from type=registry,ref=$image -"
 fi
 
-# Create a Docker image.
 case $arch in
 x86_64)
   # Debian 8 (Jessie) released in April 2015
-  cat <<EOF | $docker_build
+  cat <<EOF | $image_build
 FROM debian:jessie-20210326@sha256:32ad5050caffb2c7e969dac873bce2c370015c2256ff984b70c1c08b3a2816a0
 ENV DEBIAN_FRONTEND=noninteractive TZ=UTC
 RUN sed -i -e '/^deb/d' -e 's/^# deb /deb [trusted=yes] /g' /etc/apt/sources.list && \
@@ -150,7 +146,7 @@ aarch64 | arm | ppc64le | s390x)
   # We don't want to build Clang for these targets with Qemu becuase
   # that'd take extremely long time. Also I believe old build machines
   # are usually x86-64.
-  cat <<EOF | $docker_build
+  cat <<EOF | $image_build
 FROM debian:bullseye-20240904@sha256:8ccc486c29a3ad02ad5af7f1156e2152dff3ba5634eec9be375269ef123457d8
 ENV DEBIAN_FRONTEND=noninteractive TZ=UTC
 RUN sed -i -e '/^deb/d' -e 's/^# deb /deb [trusted=yes] /g' /etc/apt/sources.list && \
@@ -163,8 +159,8 @@ RUN sed -i -e '/^deb/d' -e 's/^# deb /deb [trusted=yes] /g' /etc/apt/sources.lis
 EOF
   ;;
 riscv64)
-  cat <<EOF | $docker_build
-FROM riscv64/debian:unstable-20240926@sha256:25654919c2926f38952cdd14b3300d83d13f2d820715f78c9f4b7a1d9399bf48
+  cat <<EOF | $image_build
+FROM docker.io/riscv64/debian:unstable-20240926@sha256:25654919c2926f38952cdd14b3300d83d13f2d820715f78c9f4b7a1d9399bf48
 ENV DEBIAN_FRONTEND=noninteractive TZ=UTC
 RUN sed -i -e '/^URIs/d' -e 's/^# http/URIs: http/' /etc/apt/sources.list.d/debian.sources && \
   echo 'Acquire::Retries "10"; Acquire::http::timeout "10"; Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/80-retries && \
@@ -175,7 +171,25 @@ RUN sed -i -e '/^URIs/d' -e 's/^# http/URIs: http/' /etc/apt/sources.list.d/debi
   rm -rf /var/lib/apt/lists
 EOF
   ;;
+loongarch64)
+  # LoongArch build is not reproducible yet
+  cat <<EOF | $image_build
+FROM docker.io/loongarch64/debian:sid
+ENV DEBIAN_FRONTEND=noninteractive TZ=UTC
+RUN apt-get update && \
+  apt-get install -y --no-install-recommends build-essential gcc-14 g++-14 clang-17 cmake && \
+  ln -sf /usr/bin/clang-17 /usr/bin/clang && \
+  ln -sf /usr/bin/clang++-17 /usr/bin/clang++ && \
+  rm -rf /var/lib/apt/lists
+EOF
+  ;;
+*)
+  usage
+  ;;
 esac
+
+version=$(sed -n 's/^project(mold VERSION \(.*\))/\1/p' CMakeLists.txt)
+dest=mold-$version-$arch-linux
 
 # Source tarballs available on GitHub don't contain .git history.
 # Clone the repo if missing.
@@ -186,7 +200,10 @@ esac
 timestamp="$(git log -1 --format=%ci)"
 
 # Build mold in a container.
-docker run --platform linux/$arch -i --rm -v "$(pwd):/mold" $image bash -c "
+mkdir -p dist
+
+$cmd --platform linux/$arch -i --rm -v "$(pwd):/mold:ro" -v "$(pwd)/dist:/dist" \
+  $image bash -c "
 set -e
 mkdir /build
 cd /build
@@ -195,11 +212,13 @@ cmake --build . -j\$(nproc)
 cmake --install .
 cmake -DMOLD_USE_MOLD=1 .
 cmake --build . -j\$(nproc)
-ctest --output-on-failure -j\$(nproc)
+ctest --output-on-failure -j4
 cmake --install . --prefix $dest --strip
 find $dest -print | xargs touch --no-dereference --date='$timestamp'
-find $dest -print | sort | tar -cf - --no-recursion --files-from=- | gzip -9nc > /mold/$dest.tar.gz
-cp mold /mold
-chown $(id -u):$(id -g) /mold/$dest.tar.gz /mold/mold
-sha256sum /mold/$dest.tar.gz
+find $dest -print | sort | tar -cf - --no-recursion --files-from=- | gzip -9nc > /dist/$dest.tar.gz
+cp mold /dist
+if [ \"\$container\" != podman ]; then
+  chown $(id -u):$(id -g) /dist/$dest.tar.gz /dist/mold
+fi
+sha256sum /dist/$dest.tar.gz
 "
