@@ -18,7 +18,7 @@
 # commit with release tags by rebuilding the binaries yourself.
 #
 # Debian provides snapshot.debian.org to host all historical binary
-# packages. We use it to construct Docker images pinned to a
+# packages. We use it to construct Podman images pinned to a
 # particular timestamp.
 #
 # We aim to use a reasonably old Debian version because we'll dynamically
@@ -60,17 +60,15 @@ case $# in
   usage
 esac
 
-# Create a Docker image.
+# Create a Podman image.
 if [ "$GITHUB_REPOSITORY" = '' ]; then
-  cmd="podman run --userns=host"
   image=mold-builder-$arch
   image_build="podman build --arch $arch -t $image -"
 else
   # If this script is running on GitHub Actions, we want to cache
   # the created container image in GitHub's container repostiory.
-  cmd="docker run"
   image=ghcr.io/$GITHUB_REPOSITORY/mold-builder-$arch
-  image_build="docker buildx build --platform linux/$arch -t $image --push --cache-to type=inline --cache-from type=registry,ref=$image -"
+  image_build="podman build --platform linux/$arch -t $image --output=type=registry --layers --cache-to $image --cache-from $image -"
 fi
 
 case $arch in
@@ -202,8 +200,8 @@ timestamp="$(git log -1 --format=%ci)"
 # Build mold in a container.
 mkdir -p dist
 
-$cmd --platform linux/$arch -i --rm -v "$(pwd):/mold:ro" -v "$(pwd)/dist:/dist" \
-  $image bash -c "
+podman run --platform linux/$arch -i --rm --userns=host \
+  -v "$(pwd):/mold:ro" -v "$(pwd)/dist:/dist" $image bash -c "
 set -e
 mkdir /build
 cd /build
@@ -217,8 +215,5 @@ cmake --install . --prefix $dest --strip
 find $dest -print | xargs touch --no-dereference --date='$timestamp'
 find $dest -print | sort | tar -cf - --no-recursion --files-from=- | gzip -9nc > /dist/$dest.tar.gz
 cp mold /dist
-if [ \"\$container\" != podman ]; then
-  chown $(id -u):$(id -g) /dist/$dest.tar.gz /dist/mold
-fi
 sha256sum /dist/$dest.tar.gz
 "
