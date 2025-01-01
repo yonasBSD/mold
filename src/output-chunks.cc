@@ -534,11 +534,10 @@ void ShstrtabSection<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 i64 DynstrSection<E>::add_string(std::string_view str) {
-  if (this->shdr.sh_size == 0)
+  if (this->shdr.sh_size == 0) {
+    strings.insert({"", 0});
     this->shdr.sh_size = 1;
-
-  if (str.empty())
-    return 0;
+  }
 
   auto [it, inserted] = strings.insert({str, this->shdr.sh_size});
   if (inserted)
@@ -548,9 +547,6 @@ i64 DynstrSection<E>::add_string(std::string_view str) {
 
 template <typename E>
 i64 DynstrSection<E>::find_string(std::string_view str) {
-  if (str.empty())
-    return 0;
-
   auto it = strings.find(str);
   assert(it != strings.end());
   return it->second;
@@ -559,7 +555,6 @@ i64 DynstrSection<E>::find_string(std::string_view str) {
 template <typename E>
 void DynstrSection<E>::copy_buf(Context<E> &ctx) {
   u8 *base = ctx.buf + this->shdr.sh_offset;
-  base[0] = '\0';
 
   for (std::pair<std::string_view, i64> p : strings)
     write_string(base + p.second, p.first);
@@ -672,7 +667,7 @@ static bool contains_variant_pcs(Context<E> &ctx) {
   return false;
 }
 
-// RISC-V has the same feature but with different names.
+// RISC-V has the same feature but with a different name.
 template <is_riscv E>
 static bool contains_variant_cc(Context<E> &ctx) {
   for (Symbol<E> *sym : ctx.plt->symbols)
@@ -1962,18 +1957,20 @@ void GnuHashSection<E>::copy_buf(Context<E> &ctx) {
 
   i64 first_exported = ctx.dynsym->symbols.size() - num_exported;
 
-  std::span<Symbol<E> *> syms = ctx.dynsym->symbols;
-  syms = syms.subspan(first_exported);
-
-  std::vector<u32> indices(num_exported);
-
   *(U32<E> *)base = num_buckets;
   *(U32<E> *)(base + 4) = first_exported;
   *(U32<E> *)(base + 8) = num_bloom;
   *(U32<E> *)(base + 12) = BLOOM_SHIFT;
 
+  std::span<Symbol<E> *> syms = ctx.dynsym->symbols;
+  syms = syms.subspan(first_exported);
+
+  if (syms.empty())
+    return;
+
   // Write a bloom filter
   Word<E> *bloom = (Word<E> *)(base + HEADER_SIZE);
+  std::vector<u32> indices(num_exported);
 
   for (i64 i = 0; i < syms.size(); i++) {
     constexpr i64 word_bits = sizeof(Word<E>) * 8;
