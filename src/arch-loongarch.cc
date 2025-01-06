@@ -870,7 +870,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 }
 
 template <>
-void shrink_section(Context<E> &ctx, InputSection<E> &isec, bool use_rvc) {
+void shrink_section(Context<E> &ctx, InputSection<E> &isec) {
   std::span<const ElfRel<E>> rels = isec.get_rels(ctx);
   std::vector<RelocDelta> &deltas = isec.extra.r_deltas;
   u8 *buf = (u8 *)isec.contents.data();
@@ -909,8 +909,10 @@ void shrink_section(Context<E> &ctx, InputSection<E> &isec, bool use_rvc) {
 
       u64 delta = deltas.empty() ? 0 : deltas.back().delta;
       u64 loc = isec.get_addr() + r.r_offset - delta;
-      u64 next_loc = loc + alignment - 4;
-      remove(next_loc - align_to(loc, alignment));
+      u64 desired = align_to(loc, alignment);
+      u64 actual = loc + alignment - 4;
+      if (desired != actual)
+        remove(actual - desired);
       continue;
     }
 

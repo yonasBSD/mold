@@ -161,7 +161,7 @@ void create_synthetic_sections(Context<E> &ctx) {
 
     // If .dynamic exists, .dynsym and .dynstr must exist as well
     // since .dynamic refers to them.
-    ctx.dynstr->shdr.sh_size = 1;
+    ctx.dynstr->add_string("");
     ctx.dynsym->symbols.resize(1);
   }
 
@@ -3231,6 +3231,15 @@ void show_stats(Context<E> &ctx) {
       if (OutputSection<E> *osec = chunk->to_osec())
         for (std::unique_ptr<Thunk<E>> &thunk : osec->thunks)
           thunk_bytes += thunk->size();
+  }
+
+  if constexpr (is_riscv<E> || is_loongarch<E>) {
+    static Counter num_rels("shrunk_relocs");
+    for (Chunk<E> *chunk : ctx.chunks)
+      if (OutputSection<E> *osec = chunk->to_osec())
+        if (osec->shdr.sh_flags & SHF_EXECINSTR)
+          for (InputSection<E> *isec : osec->members)
+            num_rels += isec->extra.r_deltas.size();
   }
 
   Counter::print();
