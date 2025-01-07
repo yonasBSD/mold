@@ -699,7 +699,6 @@ public:
   }
 
   void update_shdr(Context<E> &ctx) override;
-  void sort(Context<E> &ctx);
 };
 
 template <typename E>
@@ -758,8 +757,6 @@ public:
   i64 add_string(std::string_view str);
   i64 find_string(std::string_view str);
   void copy_buf(Context<E> &ctx) override;
-
-  i64 dynsym_offset = -1;
 
 private:
   std::unordered_map<std::string_view, i64> strings;
@@ -832,6 +829,7 @@ public:
   void copy_buf(Context<E> &ctx) override;
 
   std::vector<Symbol<E> *> symbols;
+  i64 dynstr_offset = -1;
 };
 
 template <typename E>
@@ -1686,6 +1684,7 @@ template <typename E> void compute_section_headers(Context<E> &);
 template <typename E> i64 set_osec_offsets(Context<E> &);
 template <typename E> void fix_synthetic_symbols(Context<E> &);
 template <typename E> void compress_debug_sections(Context<E> &);
+template <typename E> void sort_reldyn(Context<E> &);
 template <typename E> void write_build_id(Context<E> &);
 template <typename E> void write_gnu_debuglink(Context<E> &);
 template <typename E> void write_separate_debug_file(Context<E> &ctx);

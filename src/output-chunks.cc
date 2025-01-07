@@ -408,47 +408,6 @@ void RelDynSection<E>::update_shdr(Context<E> &ctx) {
 }
 
 template <typename E>
-void RelDynSection<E>::sort(Context<E> &ctx) {
-  Timer t(ctx, "sort_dynamic_relocs");
-
-  ElfRel<E> *begin = (ElfRel<E> *)(ctx.buf + this->shdr.sh_offset);
-  ElfRel<E> *end = begin + this->shdr.sh_size / sizeof(ElfRel<E>);
-
-  auto get_rank = [](u32 r_type) {
-    if (r_type == E::R_RELATIVE)
-      return 0;
-    if constexpr (supports_ifunc<E>)
-      if (r_type == E::R_IRELATIVE)
-        return 2;
-    return 1;
-  };
-
-  // This is the reason why we sort dynamic relocations. Quote from
-  // https://www.airs.com/blog/archives/186:
-  //
-  //   The dynamic linker in glibc uses a one element cache when processing
-  //   relocs: if a relocation refers to the same symbol as the previous
-  //   relocation, then the dynamic linker reuses the value rather than
-  //   looking up the symbol again. Thus the dynamic linker gets the best
-  //   results if the dynamic relocations are sorted so that all dynamic
-  //   relocations for a given dynamic symbol are adjacent.
-  //
-  //   Other than that, the linker sorts together all relative relocations,
-  //   which don't have symbols. Two relative relocations, or two relocations
-  //   against the same symbol, are sorted by the address in the output
-  //   file. This tends to optimize paging and caching when there are two
-  //   references from the same page.
-  //
-  // We group IFUNC relocations at the end of .rel.dyn because we want to
-  // apply all the other relocations before running user-supplied ifunc
-  // resolver functions.
-  tbb::parallel_sort(begin, end, [&](const ElfRel<E> &a, const ElfRel<E> &b) {
-    return std::tuple(get_rank(a.r_type), a.r_sym, a.r_offset) <
-           std::tuple(get_rank(b.r_type), b.r_sym, b.r_offset);
-  });
-}
-
-template <typename E>
 void RelrDynSection<E>::update_shdr(Context<E> &ctx) {
   i64 n = 0;
   for (Chunk<E> *chunk : ctx.chunks)
@@ -559,7 +518,7 @@ void DynstrSection<E>::copy_buf(Context<E> &ctx) {
   for (std::pair<std::string_view, i64> p : strings)
     write_string(base + p.second, p.first);
 
-  i64 off = dynsym_offset;
+  i64 off = ctx.dynsym->dynstr_offset;
   for (Symbol<E> *sym : ctx.dynsym->symbols)
     if (sym)
       off += write_string(base + off, sym->name());
@@ -852,7 +811,6 @@ static std::vector<Word<E>> create_dynamic_section(Context<E> &ctx) {
 
   for (i64 i = 0; i < ctx.arg.spare_dynamic_tags; i++)
     define(DT_NULL, 0);
-
   return vec;
 }
 
@@ -1758,9 +1716,10 @@ template <typename E>
 static u64 get_symbol_size(Symbol<E> &sym) {
   const ElfSym<E> &esym = sym.esym();
   if constexpr (is_riscv<E> || is_loongarch<E>)
-    if (InputSection<E> *isec = sym.get_input_section())
-      if (!isec->extra.r_deltas.empty())
-        return esym.st_size - get_r_delta(*isec, esym.st_value + esym.st_size);
+    if (esym.st_size > 0)
+      if (InputSection<E> *isec = sym.get_input_section())
+        return esym.st_size + esym.st_value - sym.value -
+               get_r_delta(*isec, esym.st_value + esym.st_size);
   return esym.st_size;
 }
 
@@ -1903,14 +1862,14 @@ void DynsymSection<E>::update_shdr(Context<E> &ctx) {
 template <typename E>
 void DynsymSection<E>::copy_buf(Context<E> &ctx) {
   ElfSym<E> *buf = (ElfSym<E> *)(ctx.buf + this->shdr.sh_offset);
-  i64 name_offset = ctx.dynstr->dynsym_offset;
+  i64 offset = dynstr_offset;
 
   memset(buf, 0, sizeof(ElfSym<E>));
 
   for (i64 i = 1; i < symbols.size(); i++) {
     Symbol<E> &sym = *symbols[i];
-    buf[sym.get_dynsym_idx(ctx)] = to_output_esym(ctx, sym, name_offset, nullptr);
-    name_offset += sym.name().size() + 1;
+    buf[sym.get_dynsym_idx(ctx)] = to_output_esym(ctx, sym, offset, nullptr);
+    offset += sym.name().size() + 1;
   }
 }
 
